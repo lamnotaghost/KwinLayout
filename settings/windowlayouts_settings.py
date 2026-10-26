@@ -208,6 +208,51 @@ def load_open_apps(catalog):
     return sorted(result, key=lambda a: a["name"].lower())
 
 
+class SizeLimits:
+
+    def __init__(self):
+        settings = QSettings(RUNTIME_PATH, QSettings.Format.IniFormat)
+        try:
+            sizes = json.loads(settings.value("Runtime/minSizes", "") or "{}")
+        except ValueError:
+            sizes = {}
+        try:
+            areas = json.loads(settings.value("Runtime/screenAreas", "") or "[]")
+        except ValueError:
+            areas = []
+        self.sizes = sizes if isinstance(sizes, dict) else {}
+        areas = [a for a in areas if isinstance(a, dict) and a.get("w", 0) > 0 and a.get("h", 0) > 0] \
+            if isinstance(areas, list) else []
+        if not areas:
+            geo = (QApplication.primaryScreen().availableGeometry()
+                   if QApplication.primaryScreen() else None)
+            areas = [{"w": geo.width(), "h": geo.height()}] if geo else []
+        self.area = (min(a["w"] for a in areas), min(a["h"] for a in areas)) if areas else None
+
+    def minimum(self, app):
+        if not app:
+            return None
+        for key in (app.get("id"), app.get("wmClass")):
+            key = (key or "").lower()
+            if key.endswith(".desktop"):
+                key = key[:-len(".desktop")]
+            m = self.sizes.get(key)
+            if isinstance(m, dict) and (m.get("w", 0) > 0 or m.get("h", 0) > 0):
+                return int(m.get("w", 0)), int(m.get("h", 0))
+        return None
+
+    def problems(self, apps, geometry):
+        result = {}
+        if not self.area:
+            return result
+        aw, ah = self.area
+        for i, (app, (_x, _y, w, h)) in enumerate(zip(apps, geometry)):
+            m = self.minimum(app)
+            if m and (w * aw < m[0] - 1 or h * ah < m[1] - 1):
+                result[i] = m
+        return result
+
+
 PRESETS = [
     ("cols2", "Две колонки", lambda r: [(0, 0, r, 1), (r, 0, 1 - r, 1)], 0.5),
     ("rows2", "Две строки", lambda r: [(0, 0, 1, r), (0, r, 1, 1 - r)], 0.5),
@@ -344,6 +389,7 @@ class SlotCanvas(QWidget):
         self.press_pos = None
         self.press_index = -1
         self.drop_index = -1
+        self.problems = {}
         self.setMouseTracking(True)
         self.setAcceptDrops(True)
         self.setMinimumSize(480, 270)
@@ -397,6 +443,11 @@ class SlotCanvas(QWidget):
                 fill = QColor(hl)
                 fill.setAlphaF(0.18)
                 border = QColor(hl)
+            bad = self.problems.get(i)
+            if bad:
+                border = QColor(218, 68, 83)
+                fill = QColor(border)
+                fill.setAlphaF(0.12)
             path = QPainterPath()
             path.addRoundedRect(r, 6, 6)
             p.fillPath(path, fill)
@@ -416,6 +467,12 @@ class SlotCanvas(QWidget):
             text_rect = QRectF(r.x() + 6, r.center().y() + side / 2 - 4, r.width() - 12, 22)
             p.drawText(text_rect, Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop,
                        p.fontMetrics().elidedText(label, Qt.TextElideMode.ElideRight, int(text_rect.width())))
+            if bad:
+                p.setPen(border)
+                warn_rect = QRectF(r.x() + 6, text_rect.bottom(), r.width() - 12, 22)
+                warn = "Мало места: нужно от %d×%d" % bad
+                p.drawText(warn_rect, Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop,
+                           p.fontMetrics().elidedText(warn, Qt.TextElideMode.ElideRight, int(warn_rect.width())))
             if app and i == self.hover:
                 c = self.close_rect(i)
                 p.setPen(Qt.PenStyle.NoPen)
@@ -520,6 +577,7 @@ class TemplateEditor(QDialog):
     def __init__(self, catalog, template=None, parent=None):
         super().__init__(parent)
         self.catalog = catalog
+        self.limits = SizeLimits()
         self.template = json.loads(json.dumps(template)) if template else None
         self.setWindowTitle("Изменить шаблон" if template else "Новый шаблон")
 
@@ -565,6 +623,7 @@ class TemplateEditor(QDialog):
 
         self.schemes.changed.connect(self._preset_changed)
         self.ratio.valueChanged.connect(self._ratio_changed)
+        self.canvas.changed.connect(self._check_sizes)
         if self.template:
             self.canvas.apps = [self._app_from_slot(s) for s in self.template["slots"]]
         self.schemes.select(KEEP_PRESET if self.template else PRESETS[0][0])
@@ -584,12 +643,31 @@ class TemplateEditor(QDialog):
         pid = self.schemes.current()
         return next((p for p in PRESETS if p[0] == pid), None)
 
-    def _geometry(self):
+    def _geometry(self, value=None):
         preset = self._preset()
         if preset is None:
             return [(s["x"], s["y"], s["w"], s["h"]) for s in self.template["slots"]]
         _pid, _title, fn, default = preset
-        return fn(self.ratio.value() / 100 if default is not None else 0.5)
+        value = self.ratio.value() if value is None else value
+        return fn(value / 100 if default is not None else 0.5)
+
+    def _fits(self, value):
+        return not self.limits.problems(self.canvas.apps, self._geometry(value))
+
+    def _check_sizes(self):
+        preset = self._preset()
+        if preset is not None and preset[3] is not None and not self._fits(self.ratio.value()):
+            current = self.ratio.value()
+            allowed = [v for v in range(self.ratio.minimum(), self.ratio.maximum() + 1) if self._fits(v)]
+            if allowed:
+                best = min(allowed, key=lambda v: abs(v - current))
+                self.ratio.blockSignals(True)
+                self.ratio.setValue(best)
+                self.ratio.blockSignals(False)
+                self.ratio_label.setText("%d / %d" % (best, 100 - best))
+                self.canvas.set_geometry(self._geometry())
+        self.canvas.problems = self.limits.problems(self.canvas.apps, self._geometry())
+        self.canvas.update()
 
     def _preset_changed(self, _pid=None):
         preset = self._preset()
@@ -606,6 +684,7 @@ class TemplateEditor(QDialog):
     def _ratio_changed(self, *_):
         self.ratio_label.setText("%d / %d" % (self.ratio.value(), 100 - self.ratio.value()))
         self.canvas.set_geometry(self._geometry())
+        self._check_sizes()
 
     def _slots(self):
         slots = []
@@ -625,6 +704,15 @@ class TemplateEditor(QDialog):
         if missing:
             QMessageBox.warning(self, "Шаблон", "Выберите приложение для части %s." %
                                 ", ".join(str(m) for m in missing))
+            return
+        problems = self.limits.problems(self.canvas.apps, self._geometry())
+        if problems:
+            lines = ["%s — нужно не меньше %d×%d" % (self.canvas.apps[i]["name"], m[0], m[1])
+                     for i, m in sorted(problems.items())]
+            QMessageBox.warning(self, "Шаблон",
+                                "Приложения не помещаются в свои части (экран %d×%d):\n\n%s\n\n"
+                                "Выберите другую схему или поменяйте приложения местами." %
+                                (self.limits.area[0], self.limits.area[1], "\n".join(lines)))
             return
         super().accept()
 

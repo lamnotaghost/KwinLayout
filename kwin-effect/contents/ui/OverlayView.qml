@@ -28,71 +28,78 @@ Item {
         desktop: Workspace.currentDesktop
         outputName: view.scr ? view.scr.name : ""
     }
-    Repeater {
-        model: view.ov ? view.ov.backdropWindows : []
-        delegate: Item {
-            id: win
-            required property var modelData
-            readonly property string wid: String(modelData.internalId)
-            readonly property var mv: {
-                var items = view.ov ? view.ov.moveItems : [];
-                for (var i = 0; i < items.length; ++i) {
-                    if (String(items[i].w.internalId) === wid) {
-                        return items[i];
+    Item {
+        anchors.fill: parent
+        Repeater {
+            model: view.ov ? view.ov.backdropWindows : []
+            delegate: Item {
+                id: win
+                required property var modelData
+                z: modelData.stackingOrder
+                readonly property string wid: String(modelData.internalId)
+                readonly property var mv: {
+                    var items = view.ov ? view.ov.moveItems : [];
+                    for (var i = 0; i < items.length; ++i) {
+                        if (String(items[i].w.internalId) === wid) {
+                            return items[i];
+                        }
+                    }
+                    return null;
+                }
+                readonly property rect live: modelData.frameGeometry
+                property real t: 0
+                readonly property real fx: mv ? mv.from.x + (mv.to.x - mv.from.x) * t : live.x
+                readonly property real fy: mv ? mv.from.y + (mv.to.y - mv.from.y) * t : live.y
+                readonly property real fw: mv ? mv.from.w + (mv.to.w - mv.from.w) * t : live.width
+                readonly property real fh: mv ? mv.from.h + (mv.to.h - mv.from.h) * t : live.height
+
+                x: fx - view.geo.x
+                y: fy - view.geo.y
+                width: fw
+                height: fh
+                visible: fx < view.geo.x + view.geo.width && fx + fw > view.geo.x
+                    && fy < view.geo.y + view.geo.height && fy + fh > view.geo.y
+
+                KWinComponents.WindowThumbnail {
+                    id: thumb
+                    client: win.modelData
+                    width: Math.max(1, win.live.width)
+                    height: Math.max(1, win.live.height)
+                    transform: Scale {
+                        xScale: win.width / thumb.width
+                        yScale: win.height / thumb.height
                     }
                 }
-                return null;
-            }
-            readonly property rect live: modelData.frameGeometry
-            property real t: 0
-            readonly property real fx: mv ? mv.from.x + (mv.to.x - mv.from.x) * t : live.x
-            readonly property real fy: mv ? mv.from.y + (mv.to.y - mv.from.y) * t : live.y
-            readonly property real fw: mv ? mv.from.w + (mv.to.w - mv.from.w) * t : live.width
-            readonly property real fh: mv ? mv.from.h + (mv.to.h - mv.from.h) * t : live.height
 
-            x: fx - view.geo.x
-            y: fy - view.geo.y
-            width: fw
-            height: fh
-            visible: fx < view.geo.x + view.geo.width && fx + fw > view.geo.x
-                && fy < view.geo.y + view.geo.height && fy + fh > view.geo.y
-
-            KWinComponents.WindowThumbnail {
-                id: thumb
-                client: win.modelData
-                width: Math.max(1, win.live.width)
-                height: Math.max(1, win.live.height)
-                transform: Scale {
-                    xScale: win.width / thumb.width
-                    yScale: win.height / thumb.height
+                Rectangle {
+                    anchors.fill: parent
+                    color: "black"
+                    opacity: !view.ov ? 0
+                        : view.ov.mode === "pick" && !view.ov.closing
+                            ? (view.ov.pickCurrent && String(view.ov.pickCurrent.internalId) === win.wid ? 0 : 0.55)
+                            : view.ov.isDimmed(win.modelData) ? view.ov.dimStrength : 0
+                    Behavior on opacity {
+                        NumberAnimation { duration: Kirigami.Units.longDuration }
+                    }
                 }
-            }
 
-            Rectangle {
-                anchors.fill: parent
-                color: "black"
-                opacity: view.ov && view.ov.isDimmed(win.modelData) ? view.ov.dimStrength : 0
-                Behavior on opacity {
-                    NumberAnimation { duration: Kirigami.Units.longDuration }
+                onMvChanged: {
+                    anim.stop();
+                    t = 0;
+                    if (mv) {
+                        anim.start();
+                    }
                 }
-            }
 
-            onMvChanged: {
-                anim.stop();
-                t = 0;
-                if (mv) {
-                    anim.start();
+                NumberAnimation {
+                    id: anim
+                    target: win
+                    property: "t"
+                    from: 0
+                    to: 1
+                    duration: view.ov ? view.ov.moveDuration : 0
+                    easing.type: Easing.InOutCubic
                 }
-            }
-
-            NumberAnimation {
-                id: anim
-                target: win
-                property: "t"
-                from: 0
-                to: 1
-                duration: view.ov ? view.ov.moveDuration : 0
-                easing.type: Easing.InOutCubic
             }
         }
     }
@@ -113,6 +120,12 @@ Item {
         active: view.isTarget && view.ov.mode === "switcher"
         anchors.fill: parent
         sourceComponent: switcherComponent
+    }
+
+    Loader {
+        active: view.isTarget && view.ov.mode === "pick"
+        anchors.fill: parent
+        sourceComponent: pickComponent
     }
 
     Component {
@@ -618,6 +631,213 @@ Item {
                         text: view.ov.justSavedName
                             ? "Шаблон «" + view.ov.justSavedName + "» сохранён"
                             : "Enter — применить · Esc — закрыть · 1–9 — сразу"
+                    }
+                }
+            }
+        }
+    }
+
+    Component {
+        id: pickComponent
+
+        Item {
+            id: pk
+            readonly property int thumbWidth: 240
+            readonly property int thumbHeight: 150
+            readonly property int cellWidth: thumbWidth + 2 * Kirigami.Units.largeSpacing
+            readonly property int columns: Math.max(1, Math.min(view.ov.pickWindows.length,
+                                                                Math.floor((width * 0.85) / cellWidth)))
+
+            Kirigami.ShadowedRectangle {
+                id: pickPanel
+                anchors.centerIn: parent
+                width: Math.max(440, pk.columns * pk.cellWidth) + 2 * Kirigami.Units.largeSpacing
+                height: pickColumn.implicitHeight + 2 * Kirigami.Units.largeSpacing
+                radius: Kirigami.Units.cornerRadius
+                color: Kirigami.Theme.backgroundColor
+                border.width: 1
+                border.color: Qt.rgba(Kirigami.Theme.textColor.r, Kirigami.Theme.textColor.g,
+                                      Kirigami.Theme.textColor.b, 0.2)
+                shadow.size: 32
+                shadow.yOffset: 6
+                shadow.color: Qt.rgba(0, 0, 0, 0.45)
+
+                opacity: 0
+                scale: 0.95
+                Component.onCompleted: pickAppear.start()
+                ParallelAnimation {
+                    id: pickAppear
+                    NumberAnimation { target: pickPanel; property: "opacity"; to: 1; duration: Kirigami.Units.longDuration; easing.type: Easing.OutCubic }
+                    NumberAnimation { target: pickPanel; property: "scale"; to: 1; duration: Kirigami.Units.longDuration; easing.type: Easing.OutCubic }
+                }
+                ParallelAnimation {
+                    id: pickDisappear
+                    NumberAnimation { target: pickPanel; property: "opacity"; to: 0; duration: Kirigami.Units.longDuration; easing.type: Easing.InCubic }
+                    NumberAnimation { target: pickPanel; property: "scale"; to: 0.95; duration: Kirigami.Units.longDuration; easing.type: Easing.InCubic }
+                }
+                Connections {
+                    target: view.ov
+                    function onClosingChanged() {
+                        if (view.ov.closing) {
+                            pickAppear.stop();
+                            pickDisappear.start();
+                        } else {
+                            pickDisappear.stop();
+                            pickAppear.start();
+                        }
+                    }
+                }
+
+                MouseArea {
+                    anchors.fill: parent
+                    acceptedButtons: Qt.AllButtons
+                }
+
+                ColumnLayout {
+                    id: pickColumn
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.top: parent.top
+                    anchors.margins: Kirigami.Units.largeSpacing
+                    spacing: Kirigami.Units.largeSpacing
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: Kirigami.Units.largeSpacing
+
+                        Rectangle {
+                            id: slotPreview
+                            Layout.preferredWidth: Math.round(Layout.preferredHeight * view.ov.screenAspect)
+                            Layout.preferredHeight: 54
+                            radius: Kirigami.Units.smallSpacing
+                            color: Qt.rgba(Kirigami.Theme.textColor.r, Kirigami.Theme.textColor.g,
+                                           Kirigami.Theme.textColor.b, 0.08)
+
+                            Repeater {
+                                model: view.ov.pickTemplate ? view.ov.pickTemplate.slots : []
+                                Rectangle {
+                                    required property var modelData
+                                    required property int index
+                                    readonly property bool target: !!view.ov.pickEntry && view.ov.pickEntry.index === index
+                                    readonly property real fx0: Math.min(Math.max(modelData.x, 0), 0.95)
+                                    readonly property real fy0: Math.min(Math.max(modelData.y, 0), 0.95)
+                                    x: fx0 * slotPreview.width + 1
+                                    y: fy0 * slotPreview.height + 1
+                                    width: Math.max(3, Math.min(modelData.w, 1 - fx0) * slotPreview.width - 2)
+                                    height: Math.max(3, Math.min(modelData.h, 1 - fy0) * slotPreview.height - 2)
+                                    radius: 2
+                                    color: target ? Kirigami.Theme.highlightColor : Kirigami.Theme.alternateBackgroundColor
+                                    border.width: 1
+                                    border.color: Qt.rgba(Kirigami.Theme.textColor.r, Kirigami.Theme.textColor.g,
+                                                          Kirigami.Theme.textColor.b, 0.3)
+                                }
+                            }
+                        }
+
+                        ColumnLayout {
+                            Layout.fillWidth: true
+                            spacing: 0
+                            PC3.Label {
+                                Layout.fillWidth: true
+                                font.bold: true
+                                elide: Text.ElideRight
+                                text: view.ov.pickEntry
+                                    ? "Какое окно «" + (view.ov.pickEntry.slot.title || view.ov.core.prettyAppName(view.ov.pickEntry.slot.app)) + "» поставить?"
+                                    : ""
+                            }
+                            PC3.Label {
+                                Layout.fillWidth: true
+                                opacity: 0.7
+                                elide: Text.ElideRight
+                                text: (view.ov.pickTemplate ? "Шаблон «" + view.ov.pickTemplate.name + "»" : "")
+                                    + (view.ov.pickQueue.length > 1
+                                       ? " · выбор " + (view.ov.pickStep + 1) + " из " + view.ov.pickQueue.length : "")
+                            }
+                        }
+                    }
+
+                    GridLayout {
+                        Layout.alignment: Qt.AlignHCenter
+                        columns: pk.columns
+                        rowSpacing: 0
+                        columnSpacing: 0
+
+                        Repeater {
+                            model: view.ov.pickWindows
+                            delegate: Item {
+                                id: pickCard
+                                required property var modelData
+                                required property int index
+                                readonly property bool current: view.ov.pickIndex === index
+                                readonly property bool away: modelData.minimized || !view.ov.core.onCurrentDesktop(modelData)
+                                Layout.preferredWidth: pk.cellWidth
+                                Layout.preferredHeight: pk.thumbHeight + pickLabel.implicitHeight
+                                    + 2 * Kirigami.Units.largeSpacing + Kirigami.Units.smallSpacing
+
+                                Rectangle {
+                                    anchors.fill: parent
+                                    anchors.margins: 2
+                                    radius: Kirigami.Units.cornerRadius
+                                    visible: pickCard.current
+                                    color: Qt.rgba(Kirigami.Theme.highlightColor.r, Kirigami.Theme.highlightColor.g,
+                                                   Kirigami.Theme.highlightColor.b, 0.3)
+                                    border.width: 2
+                                    border.color: Kirigami.Theme.highlightColor
+                                }
+
+                                ColumnLayout {
+                                    anchors.fill: parent
+                                    anchors.margins: Kirigami.Units.largeSpacing
+                                    spacing: Kirigami.Units.smallSpacing
+
+                                    Item {
+                                        Layout.preferredWidth: pk.thumbWidth
+                                        Layout.preferredHeight: pk.thumbHeight
+
+                                        KWinComponents.WindowThumbnail {
+                                            anchors.fill: parent
+                                            client: pickCard.modelData
+                                            opacity: pickCard.away ? 0.6 : 1
+                                        }
+
+                                        Kirigami.Icon {
+                                            anchors.right: parent.right
+                                            anchors.bottom: parent.bottom
+                                            width: Kirigami.Units.iconSizes.medium
+                                            height: width
+                                            source: view.ov.core.windowIconName(pickCard.modelData)
+                                            fallback: "application-x-executable"
+                                        }
+                                    }
+
+                                    PC3.Label {
+                                        id: pickLabel
+                                        Layout.fillWidth: true
+                                        horizontalAlignment: Text.AlignHCenter
+                                        elide: Text.ElideRight
+                                        text: (pickCard.index < 9 ? (pickCard.index + 1) + ". " : "")
+                                            + (pickCard.modelData.caption || view.ov.core.windowAppName(pickCard.modelData))
+                                            + (pickCard.modelData.minimized ? " (свёрнуто)"
+                                               : !view.ov.core.onCurrentDesktop(pickCard.modelData) ? " (другой рабочий стол)" : "")
+                                    }
+                                }
+
+                                MouseArea {
+                                    anchors.fill: parent
+                                    hoverEnabled: true
+                                    onEntered: view.ov.pickIndex = pickCard.index
+                                    onClicked: view.ov.choose(pickCard.modelData)
+                                }
+                            }
+                        }
+                    }
+
+                    PC3.Label {
+                        Layout.fillWidth: true
+                        horizontalAlignment: Text.AlignHCenter
+                        opacity: 0.6
+                        font.pointSize: Kirigami.Theme.smallFont.pointSize
+                        text: "Enter — выбрать · Esc — назад · 1–9 — сразу"
                     }
                 }
             }

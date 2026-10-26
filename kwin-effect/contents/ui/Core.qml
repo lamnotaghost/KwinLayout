@@ -9,6 +9,7 @@ Item {
     readonly property int minOverlap: 120
     readonly property int hoverReach: 6
     readonly property int launchTimeoutMs: 45000
+    readonly property int dragMinSize: 150
 
     readonly property string cacheBust: "?v=" + Date.now()
     readonly property url storeUrl: StandardPaths.writableLocation(StandardPaths.GenericConfigLocation) + "/windowlayoutsrc"
@@ -63,8 +64,44 @@ Item {
         });
         var s = runtimeComponent.createObject(core);
         s.setValue("openApps", JSON.stringify(apps));
+        s.setValue("minSizes", JSON.stringify(collectMinSizes(s.value("minSizes", ""))));
+        var areas = [];
+        var screens = Workspace.screens;
+        for (var i = 0; i < screens.length; ++i) {
+            var a = screenArea(screens[i]);
+            areas.push({ name: screens[i].name, w: a.width, h: a.height });
+        }
+        s.setValue("screenAreas", JSON.stringify(areas));
         s.sync();
         s.destroy();
+    }
+
+    function collectMinSizes(raw) {
+        var known;
+        try {
+            known = raw ? JSON.parse(raw) : {};
+        } catch (e) {
+            known = {};
+        }
+        if (!known || typeof known !== "object" || Array.isArray(known)) {
+            known = {};
+        }
+        var fresh = {};
+        windowList().filter(isLayoutWindow).forEach(function (w) {
+            var mw = Math.ceil(minExtent(w, true)), mh = Math.ceil(minExtent(w, false));
+            [w.desktopFileName, w.resourceClass].forEach(function (k) {
+                k = String(k || "").toLowerCase().replace(/\.desktop$/, "");
+                if (!k) {
+                    return;
+                }
+                var cur = fresh[k] || { w: 0, h: 0 };
+                fresh[k] = { w: Math.max(cur.w, mw), h: Math.max(cur.h, mh) };
+            });
+        });
+        for (var k in fresh) {
+            known[k] = fresh[k];
+        }
+        return known;
     }
 
     property real lastApplyRequest: 0
@@ -89,9 +126,10 @@ Item {
             return;
         }
         console.log("windowlayouts: применяю из настроек «" + t.name + "»");
-        var moves = applyTemplate(t);
         if (overlay) {
-            overlay.playMoves(moves);
+            overlay.requestApply(t);
+        } else {
+            applyTemplate(t);
         }
     }
 
@@ -431,7 +469,8 @@ Item {
         var sides = windowsAlongEdge(e);
         var snap = function (w) {
             var g = w.frameGeometry;
-            return { w: w, x: g.x, y: g.y, width: g.width, height: g.height };
+            return { w: w, x: g.x, y: g.y, width: g.width, height: g.height,
+                     min: Math.max(dragMinSize, Math.ceil(minExtent(w, e.vertical))) };
         };
         var all = sides.before.concat(sides.after);
         drag = {
@@ -466,9 +505,10 @@ Item {
         var v = drag.edge.vertical;
         var p = Workspace.cursorPos;
         var d = v ? p.x - drag.start.x : p.y - drag.start.y;
-        var minSize = 150;
-        drag.before.forEach(function (s) { d = Math.max(d, minSize - (v ? s.width : s.height)); });
-        drag.after.forEach(function (s) { d = Math.min(d, (v ? s.width : s.height) - minSize); });
+        var lo = -Infinity, hi = Infinity;
+        drag.before.forEach(function (s) { lo = Math.max(lo, Math.min(0, s.min - (v ? s.width : s.height))); });
+        drag.after.forEach(function (s) { hi = Math.min(hi, Math.max(0, (v ? s.width : s.height) - s.min)); });
+        d = Math.max(lo, Math.min(hi, d));
 
         if (drag.tiled) {
             var outSize = v ? drag.full.width : drag.full.height;
@@ -876,7 +916,62 @@ Item {
         w.frameGeometry = rect;
     }
 
-    function templateAlreadyApplied(output, area, slots, candidates) {
+    function allowAll() {
+        return true;
+    }
+
+    function choiceFilter(chosen) {
+        if (!chosen) {
+            return allowAll;
+        }
+        var picked = [];
+        chosen.forEach(function (w) {
+            if (w && !w.deleted) {
+                picked.push(w);
+            }
+        });
+        return function (s, w) {
+            var mine = chosen[s];
+            if (mine && !mine.deleted) {
+                return w === mine;
+            }
+            return picked.indexOf(w) === -1;
+        };
+    }
+
+    function templateContext(t) {
+        var output = screenAt(Workspace.cursorPos);
+        var candidates = windowList().filter(isLayoutWindow).sort(function (u, v) {
+            var cu = onCurrentDesktop(u) ? 1 : 0, cv = onCurrentDesktop(v) ? 1 : 0;
+            return (cv - cu) || (v.stackingOrder - u.stackingOrder);
+        });
+        var slots = t.slots.map(function (slot) { return clampSlot(JSON.parse(JSON.stringify(slot))); });
+        return { output: output, area: screenArea(output), candidates: candidates, slots: slots };
+    }
+
+    function windowChoices(t) {
+        if (!t || !t.slots || t.slots.length === 0) {
+            return [];
+        }
+        var c = templateContext(t);
+        if (templateAlreadyApplied(c.output, c.area, c.slots, c.candidates, allowAll)) {
+            return [];
+        }
+        var out = [];
+        c.slots.forEach(function (slot, i) {
+            var mine = c.candidates.filter(function (w) { return sameApp(slot, w); });
+            if (mine.length === 0) {
+                return;
+            }
+            var need = c.slots.filter(function (s) { return sameApp(s, mine[0]); }).length;
+            if (mine.length > need) {
+                out.push({ index: i, slot: slot, windows: mine });
+            }
+        });
+        return out;
+    }
+
+    function templateAlreadyApplied(output, area, slots, candidates, allow) {
         var root = layoutRoot(output);
         var used = [];
         for (var s = 0; s < slots.length; ++s) {
@@ -884,7 +979,7 @@ Item {
             var found = null;
             for (var i = 0; i < candidates.length && !found; ++i) {
                 var w = candidates[i];
-                if (used.indexOf(w) !== -1 || !sameApp(slots[s], w) || !isVisibleLayoutWindow(w)
+                if (used.indexOf(w) !== -1 || !sameApp(slots[s], w) || !allow(s, w) || !isVisibleLayoutWindow(w)
                         || !w.output || w.output.name !== output.name || !w.tile || !tileInTree(w.tile, root)) {
                     continue;
                 }
@@ -900,7 +995,7 @@ Item {
         return true;
     }
 
-    function adjustExistingLayout(output, area, slots, candidates) {
+    function adjustExistingLayout(output, area, slots, candidates, allow) {
         var root = layoutRoot(output);
         if (!root) {
             return null;
@@ -912,7 +1007,7 @@ Item {
             var found = null;
             for (var i = 0; i < candidates.length && !found; ++i) {
                 var w = candidates[i];
-                if (usedWindows.indexOf(w) !== -1 || !sameApp(slots[s], w) || !isVisibleLayoutWindow(w)
+                if (usedWindows.indexOf(w) !== -1 || !sameApp(slots[s], w) || !allow(s, w) || !isVisibleLayoutWindow(w)
                         || !w.output || w.output.name !== output.name || !w.tile
                         || usedTiles.indexOf(w.tile) !== -1 || !tileInTree(w.tile, root)) {
                     continue;
@@ -1013,27 +1108,24 @@ Item {
         return out;
     }
 
-    function applyTemplate(t) {
+    function applyTemplate(t, chosen) {
         if (!t || !t.slots || t.slots.length === 0) {
             return [];
         }
-        var output = screenAt(Workspace.cursorPos);
-        var area = screenArea(output);
-        var candidates = windowList().filter(isLayoutWindow).sort(function (u, v) {
-            var cu = onCurrentDesktop(u) ? 1 : 0, cv = onCurrentDesktop(v) ? 1 : 0;
-            return (cv - cu) || (v.stackingOrder - u.stackingOrder);
-        });
-        var slots = t.slots.map(function (slot) { return clampSlot(JSON.parse(JSON.stringify(slot))); });
-        if (templateAlreadyApplied(output, area, slots, candidates)) {
+        var c = templateContext(t);
+        var output = c.output, area = c.area, candidates = c.candidates, slots = c.slots;
+        var allow = choiceFilter(chosen);
+        if (templateAlreadyApplied(output, area, slots, candidates, allow)) {
             console.log("windowlayouts: «" + t.name + "» уже применён на экране " + output.name + " — ничего не меняю");
             return [];
         }
         var tiles = reuseTiles(output, area, slots);
         var reused = !!tiles;
         if (!tiles) {
-            var adjusted = adjustExistingLayout(output, area, slots, candidates);
+            var adjusted = adjustExistingLayout(output, area, slots, candidates, allow);
             if (adjusted) {
                 console.log("windowlayouts: «" + t.name + "» — та же раскладка, сдвигаю границы плиток");
+                raiseWindows(adjusted.map(function (m) { return m.w; }));
                 markDirty();
                 return adjusted;
             }
@@ -1054,13 +1146,13 @@ Item {
             if (tile) {
                 var inTile = tile.windows;
                 for (var k = 0; inTile && k < inTile.length && !w; ++k) {
-                    if (used.indexOf(inTile[k]) === -1 && sameApp(slot, inTile[k])) {
+                    if (used.indexOf(inTile[k]) === -1 && sameApp(slot, inTile[k]) && allow(index, inTile[k])) {
                         w = inTile[k];
                     }
                 }
             }
             for (var i = 0; i < candidates.length && !w; ++i) {
-                if (used.indexOf(candidates[i]) === -1 && sameApp(slot, candidates[i])) {
+                if (used.indexOf(candidates[i]) === -1 && sameApp(slot, candidates[i]) && allow(index, candidates[i])) {
                     w = candidates[i];
                     break;
                 }
@@ -1088,14 +1180,18 @@ Item {
                 console.warn("windowlayouts: не знаю, как запустить " + (slot.title || slot.wmClass));
             }
         });
-        for (var i = placed.length - 1; i >= 0; --i) {
-            Workspace.raiseWindow(placed[i]);
-        }
-        if (placed.length > 0) {
-            Workspace.activeWindow = placed[0];
-        }
+        raiseWindows(placed);
         markDirty();
         return moves;
+    }
+
+    function raiseWindows(list) {
+        for (var i = list.length - 1; i >= 0; --i) {
+            Workspace.raiseWindow(list[i]);
+        }
+        if (list.length > 0) {
+            Workspace.activeWindow = list[0];
+        }
     }
 
     function handleNewWindow(w) {
@@ -1110,7 +1206,8 @@ Item {
             if (p.deadline > now && sameApp(p.slot, w)) {
                 pendingLaunches.splice(i, 1);
                 placeWindow(w, p.rect, p.slot, false, p.tile);
-                var again = delayedPlace.createObject(core, { target: w, targetRect: p.rect, slot: p.slot, tile: p.tile || null });
+                raiseWindows([w]);
+                var again = delayedPlace.createObject(core, { target: w, targetRect: p.rect, slot: p.slot, tile: p.tile || null, raise: true });
                 again.start();
                 return;
             }
@@ -1124,10 +1221,14 @@ Item {
             property rect targetRect
             property var slot
             property var tile: null
+            property bool raise: false
             interval: 600
             onTriggered: {
                 if (target && !target.deleted) {
                     core.placeWindow(target, targetRect, slot, true, tile);
+                    if (raise) {
+                        core.raiseWindows([target]);
+                    }
                 }
                 destroy();
             }
@@ -1423,6 +1524,7 @@ Item {
                 }
             });
             var moves = dropIntoTarget(moving, target) || [];
+            raiseWindows([moving]);
             if (overlay) {
                 overlay.playMoves(moves.filter(function (m) {
                     return before[String(m.w.internalId)];
@@ -1470,7 +1572,7 @@ Item {
         function onWindowActivated() { core.markDirty(); }
         function onCurrentDesktopChanged() { core.markDirty(); core.hideHandle(); core.closePopups(); }
         function onCurrentActivityChanged() { core.markDirty(); core.hideHandle(); core.closePopups(); }
-        function onScreensChanged() { core.markDirty(); core.hideHandle(); core.closePopups(); }
+        function onScreensChanged() { core.markDirty(); core.hideHandle(); core.closePopups(); openAppsTimer.restart(); }
     }
 
     ShortcutHandler {

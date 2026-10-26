@@ -102,6 +102,24 @@ Item {
         moveEndTimer.restart();
     }
 
+    property var pickTemplate: null
+    property var pickQueue: []
+    property int pickStep: 0
+    property int pickIndex: 0
+    property var pickChosen: []
+    property bool pickFromSwitcher: false
+    readonly property var pickEntry: pickStep < pickQueue.length ? pickQueue[pickStep] : null
+    readonly property var pickWindows: {
+        if (!pickEntry) {
+            return [];
+        }
+        var chosen = pickChosen;
+        return pickEntry.windows.filter(function (w) {
+            return !w.deleted && chosen.indexOf(w) === -1;
+        });
+    }
+    readonly property var pickCurrent: pickIndex >= 0 && pickIndex < pickWindows.length ? pickWindows[pickIndex] : null
+
     property var templates: []
     property real screenAspect: 16 / 9
     property int switcherIndex: 0
@@ -386,8 +404,63 @@ Item {
         if (i < 0 || i >= templates.length) {
             return;
         }
-        var t = templates[i];
-        animateMoves(core.applyTemplate(t));
+        requestApply(templates[i]);
+    }
+
+    function requestApply(t) {
+        var queue = core.windowChoices(t);
+        if (queue.length === 0) {
+            if (shown) {
+                animateMoves(core.applyTemplate(t));
+            } else {
+                playMoves(core.applyTemplate(t));
+            }
+            return;
+        }
+        pickFromSwitcher = open && mode === "switcher";
+        pickTemplate = t;
+        pickQueue = queue;
+        pickStep = 0;
+        pickIndex = 0;
+        pickChosen = [];
+        var screen = core.screenAt(Workspace.cursorPos);
+        var area = core.screenArea(screen);
+        screenAspect = area.height > 0 ? area.width / area.height : 16 / 9;
+        console.log("windowlayouts: «" + t.name + "» — нужно выбрать окна: "
+                    + queue.map(function (q) { return (q.slot.title || q.slot.app) + " ×" + q.windows.length; }).join(", "));
+        mode = "pick";
+        if (!pickFromSwitcher) {
+            show(screen);
+        }
+    }
+
+    function choose(w) {
+        if (!w || !pickEntry || closing) {
+            return;
+        }
+        var chosen = pickChosen.slice();
+        chosen[pickEntry.index] = w;
+        pickChosen = chosen;
+        pickIndex = 0;
+        if (pickStep + 1 < pickQueue.length) {
+            pickStep += 1;
+            return;
+        }
+        animateMoves(core.applyTemplate(pickTemplate, chosen));
+    }
+
+    function cancelPick() {
+        if (pickStep > 0) {
+            pickStep -= 1;
+            var chosen = pickChosen.slice();
+            chosen[pickQueue[pickStep].index] = undefined;
+            pickChosen = chosen;
+            pickIndex = 0;
+        } else if (pickFromSwitcher) {
+            mode = "switcher";
+        } else {
+            close();
+        }
     }
 
     function handleKey(event) {
@@ -398,7 +471,9 @@ Item {
         safetyTimer.restart();
         var key = event.key;
         if (key === Qt.Key_Escape) {
-            if (mode === "switcher" && savingName) {
+            if (mode === "pick") {
+                cancelPick();
+            } else if (mode === "switcher" && savingName) {
                 savingName = false;
             } else if (mode === "menu" && menuStep === "name") {
                 menuStep = "menu";
@@ -421,6 +496,25 @@ Item {
                 }
             } else if (menuStep === "done" && (key === Qt.Key_Return || key === Qt.Key_Enter)) {
                 close();
+            } else {
+                return;
+            }
+            event.accepted = true;
+            return;
+        }
+        if (mode === "pick") {
+            var n = pickWindows.length;
+            if (n === 0) {
+                return;
+            }
+            if (key === Qt.Key_Right || key === Qt.Key_Tab || key === Qt.Key_Down) {
+                pickIndex = (pickIndex + 1) % n;
+            } else if (key === Qt.Key_Left || key === Qt.Key_Backtab || key === Qt.Key_Up) {
+                pickIndex = (pickIndex + n - 1) % n;
+            } else if (key === Qt.Key_Return || key === Qt.Key_Enter) {
+                choose(pickCurrent);
+            } else if (key >= Qt.Key_1 && key <= Qt.Key_9 && key - Qt.Key_1 < n) {
+                choose(pickWindows[key - Qt.Key_1]);
             } else {
                 return;
             }

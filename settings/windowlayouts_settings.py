@@ -7,14 +7,17 @@ import sys
 import time
 
 import dbus
-from PyQt6.QtCore import QFileSystemWatcher, QKeyCombination, QRectF, QSettings, QSize, Qt, QTimer
-from PyQt6.QtGui import QColor, QIcon, QKeySequence, QPainter, QPainterPath, QPalette, QPixmap
+from PyQt6.QtCore import (
+    QFileSystemWatcher, QKeyCombination, QLibraryInfo, QLocale, QMimeData, QPoint, QRectF, QSettings,
+    QSize, Qt, QTimer, QTranslator, pyqtSignal,
+)
+from PyQt6.QtGui import QColor, QDrag, QIcon, QKeySequence, QPainter, QPainterPath, QPalette, QPen, QPixmap
 from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 from PyQt6.QtWidgets import (
-    QAbstractItemView, QApplication, QCheckBox, QComboBox, QCompleter, QDialog,
-    QDialogButtonBox, QFormLayout, QGroupBox, QHBoxLayout, QInputDialog, QKeySequenceEdit,
-    QLabel, QLineEdit, QListWidget, QListWidgetItem, QMessageBox, QPushButton, QSlider,
-    QVBoxLayout, QWidget,
+    QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QDialog, QDialogButtonBox,
+    QFormLayout, QFrame, QGroupBox, QHBoxLayout, QInputDialog, QKeySequenceEdit, QLabel,
+    QLineEdit, QListWidget, QListWidgetItem, QMessageBox, QPushButton, QSlider, QTabWidget,
+    QToolButton, QVBoxLayout, QWidget,
 )
 
 STORE_PATH = os.path.join(
@@ -144,7 +147,7 @@ def clamp_slot(slot):
     return x, y, max(0.05, min(slot.get("w", 1), 1 - x)), max(0.05, min(slot.get("h", 1), 1 - y))
 
 
-def render_preview(slots, catalog, size, palette):
+def render_preview(slots, catalog, size, palette, icons=True):
     w, h = size.width(), size.height()
     pix = QPixmap(w, h)
     pix.fill(Qt.GlobalColor.transparent)
@@ -167,31 +170,42 @@ def render_preview(slots, catalog, size, palette):
         p.setPen(frame)
         p.drawPath(path)
         side = int(min(32, r.width() - 6, r.height() - 6))
-        if side >= 8:
+        if icons and side >= 8:
             icon = slot_icon(slot, catalog).pixmap(side, side)
             p.drawPixmap(int(r.center().x() - side / 2), int(r.center().y() - side / 2), icon)
     p.end()
     return pix
 
 
-class PreviewWidget(QWidget):
-    def __init__(self, catalog, parent=None):
-        super().__init__(parent)
-        self.catalog = catalog
-        self.slots = []
-        self.setMinimumSize(320, 180)
+RUNTIME_PATH = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "windowlayouts-runtimerc")
 
-    def set_slots(self, slots):
-        self.slots = slots
-        self.update()
 
-    def paintEvent(self, _event):
-        w = self.width()
-        h = min(self.height(), int(w * 9 / 16))
-        w = int(h * 16 / 9)
-        pix = render_preview(self.slots, self.catalog, QSize(w, h), self.palette())
-        p = QPainter(self)
-        p.drawPixmap((self.width() - w) // 2, (self.height() - h) // 2, pix)
+def load_open_apps(catalog):
+    settings = QSettings(RUNTIME_PATH, QSettings.Format.IniFormat)
+    try:
+        raw = json.loads(settings.value("Runtime/openApps", "") or "[]")
+    except ValueError:
+        raw = []
+    by_wmclass = {}
+    for a in catalog.apps.values():
+        if a["wmClass"]:
+            by_wmclass.setdefault(a["wmClass"].lower(), a)
+        by_wmclass.setdefault(a["id"].lower(), a)
+    result, seen = [], set()
+    for item in raw if isinstance(raw, list) else []:
+        app = catalog.get(item.get("app")) or by_wmclass.get((item.get("wmClass") or "").lower())
+        entry = dict(app) if app else {
+            "id": item.get("app", ""),
+            "name": item.get("title") or item.get("wmClass") or "?",
+            "icon": item.get("icon", ""),
+            "wmClass": item.get("wmClass", ""),
+        }
+        key = (entry["id"] or entry["wmClass"]).lower()
+        if key and key not in seen:
+            seen.add(key)
+            result.append(entry)
+    return sorted(result, key=lambda a: a["name"].lower())
 
 
 PRESETS = [
@@ -208,33 +222,298 @@ PRESETS = [
 KEEP_PRESET = "keep"
 
 
-class AppCombo(QComboBox):
+class AppPicker(QFrame):
+    picked = pyqtSignal(dict)
+
+    def __init__(self, catalog, parent=None):
+        super().__init__(parent, Qt.WindowType.Popup)
+        self.setFrameShape(QFrame.Shape.StyledPanel)
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("Поиск приложения…")
+        self.search.setClearButtonEnabled(True)
+        self.tabs = QTabWidget()
+        self.open_list = self._make_list(load_open_apps(catalog))
+        self.all_list = self._make_list(catalog.visible_apps())
+        self.tabs.addTab(self.open_list, "Открытые")
+        self.tabs.addTab(self.all_list, "Все приложения")
+        if self.open_list.count() == 0:
+            self.tabs.setCurrentIndex(1)
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.search)
+        layout.addWidget(self.tabs)
+        self.search.textChanged.connect(self._filter)
+        self.search.returnPressed.connect(self._pick_first)
+        self.resize(340, 440)
+
+    def _make_list(self, apps):
+        lst = QListWidget()
+        lst.setIconSize(QSize(24, 24))
+        for app in apps:
+            item = QListWidgetItem(icon_for(app["icon"]), app["name"])
+            item.setData(Qt.ItemDataRole.UserRole, app)
+            lst.addItem(item)
+        lst.itemActivated.connect(self._pick)
+        lst.itemClicked.connect(self._pick)
+        return lst
+
+    def _filter(self, text):
+        text = text.strip().lower()
+        found = {}
+        for lst in (self.open_list, self.all_list):
+            found[lst] = 0
+            for i in range(lst.count()):
+                item = lst.item(i)
+                hidden = bool(text) and text not in item.text().lower()
+                item.setHidden(hidden)
+                found[lst] += 0 if hidden else 1
+        if text and self.tabs.currentWidget() is self.open_list and found[self.open_list] == 0 \
+                and found[self.all_list] > 0:
+            self.tabs.setCurrentWidget(self.all_list)
+
+    def _pick_first(self):
+        lst = self.tabs.currentWidget()
+        for i in range(lst.count()):
+            if not lst.item(i).isHidden():
+                self._pick(lst.item(i))
+                return
+
+    def _pick(self, item):
+        self.picked.emit(item.data(Qt.ItemDataRole.UserRole))
+        self.close()
+
+    def popup_at(self, pos):
+        screen = QApplication.screenAt(pos) or QApplication.primaryScreen()
+        area = screen.availableGeometry()
+        x = min(max(pos.x(), area.left()), area.right() - self.width())
+        y = min(max(pos.y(), area.top()), area.bottom() - self.height())
+        self.move(x, y)
+        self.show()
+        self.search.setFocus()
+
+
+def scheme_pixmap(geometry, size, palette):
+    return render_preview([{"x": x, "y": y, "w": w, "h": h} for x, y, w, h in geometry],
+                          None, size, palette, icons=False)
+
+
+class SchemeStrip(QWidget):
+    changed = pyqtSignal(str)
+
+    def __init__(self, schemes, parent=None):
+        super().__init__(parent)
+        self.group = QButtonGroup(self)
+        self.group.setExclusive(True)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+        for pid, title, geometry in schemes:
+            btn = QToolButton()
+            btn.setCheckable(True)
+            btn.setIcon(QIcon(scheme_pixmap(geometry, QSize(80, 45), self.palette())))
+            btn.setIconSize(QSize(80, 45))
+            btn.setToolTip(title)
+            btn.setProperty("pid", pid)
+            btn.setAutoRaise(True)
+            self.group.addButton(btn)
+            layout.addWidget(btn)
+        layout.addStretch(1)
+        self.group.buttonClicked.connect(lambda b: self.changed.emit(b.property("pid")))
+
+    def select(self, pid):
+        for b in self.group.buttons():
+            if b.property("pid") == pid:
+                b.setChecked(True)
+
+    def current(self):
+        b = self.group.checkedButton()
+        return b.property("pid") if b else None
+
+
+SLOT_MIME = "application/x-windowlayouts-slot"
+
+
+class SlotCanvas(QWidget):
+    changed = pyqtSignal()
 
     def __init__(self, catalog, parent=None):
         super().__init__(parent)
-        self.setEditable(True)
-        self.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
-        self.setMinimumWidth(280)
-        self.addItem(QIcon.fromTheme("list-add"), "— выберите приложение —", "")
-        for app in catalog.visible_apps():
-            self.addItem(icon_for(app["icon"]), app["name"], app["id"])
-        completer = QCompleter(self.model(), self)
-        completer.setFilterMode(Qt.MatchFlag.MatchContains)
-        completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
-        completer.setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
-        self.setCompleter(completer)
-        self.lineEdit().setPlaceholderText("Начните вводить название…")
+        self.catalog = catalog
+        self.geometry_list = []
+        self.apps = []
+        self.hover = -1
+        self.press_pos = None
+        self.press_index = -1
+        self.drop_index = -1
+        self.setMouseTracking(True)
+        self.setAcceptDrops(True)
+        self.setMinimumSize(480, 270)
 
-    def set_app(self, app_id, fallback_title=""):
-        i = self.findData(app_id)
-        if i < 0 and app_id:
-            self.addItem(QIcon.fromTheme(FALLBACK_ICON), fallback_title or app_id, app_id)
-            i = self.count() - 1
-        self.setCurrentIndex(max(0, i))
+    def set_geometry(self, geometry):
+        self.geometry_list = geometry
+        self.apps = (self.apps + [None] * len(geometry))[:len(geometry)]
+        self.update()
 
-    def app_id(self):
-        i = self.findText(self.currentText(), Qt.MatchFlag.MatchFixedString)
-        return self.itemData(i) if i >= 0 else ""
+    def area(self):
+        w = self.width()
+        h = min(self.height(), int(w * 9 / 16))
+        w = int(h * 16 / 9)
+        return QRectF((self.width() - w) / 2, (self.height() - h) / 2, w, h)
+
+    def slot_rect(self, i):
+        a = self.area()
+        x, y, w, h = self.geometry_list[i]
+        return QRectF(a.x() + x * a.width() + 3, a.y() + y * a.height() + 3,
+                      w * a.width() - 6, h * a.height() - 6)
+
+    def close_rect(self, i):
+        r = self.slot_rect(i)
+        return QRectF(r.right() - 26, r.top() + 6, 20, 20)
+
+    def index_at(self, pos):
+        for i in range(len(self.geometry_list)):
+            if self.slot_rect(i).contains(pos):
+                return i
+        return -1
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pal = self.palette()
+        text = pal.color(QPalette.ColorRole.Text)
+        hl = pal.color(QPalette.ColorRole.Highlight)
+        bg = QColor(text)
+        bg.setAlphaF(0.06)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(bg)
+        p.drawRoundedRect(self.area(), 8, 8)
+        for i in range(len(self.geometry_list)):
+            r = self.slot_rect(i)
+            app = self.apps[i]
+            active = i in (self.hover, self.drop_index)
+            fill = QColor(pal.color(QPalette.ColorRole.Base))
+            border = QColor(text)
+            border.setAlphaF(0.25)
+            if active:
+                fill = QColor(hl)
+                fill.setAlphaF(0.18)
+                border = QColor(hl)
+            path = QPainterPath()
+            path.addRoundedRect(r, 6, 6)
+            p.fillPath(path, fill)
+            pen = QPen(border, 2 if active else 1)
+            if not app:
+                pen.setStyle(Qt.PenStyle.DashLine)
+            p.setPen(pen)
+            p.drawPath(path)
+            side = int(min(48, r.width() / 2, r.height() / 2))
+            label = app["name"] if app else "Выбрать приложение"
+            icon = icon_for(app["icon"]) if app else QIcon.fromTheme("list-add")
+            p.drawPixmap(int(r.center().x() - side / 2), int(r.center().y() - side / 2 - 10),
+                         icon.pixmap(side, side))
+            color = QColor(text)
+            color.setAlphaF(1.0 if app else 0.6)
+            p.setPen(color)
+            text_rect = QRectF(r.x() + 6, r.center().y() + side / 2 - 4, r.width() - 12, 22)
+            p.drawText(text_rect, Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop,
+                       p.fontMetrics().elidedText(label, Qt.TextElideMode.ElideRight, int(text_rect.width())))
+            if app and i == self.hover:
+                c = self.close_rect(i)
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(pal.color(QPalette.ColorRole.Window))
+                p.drawEllipse(c)
+                p.drawPixmap(c.adjusted(2, 2, -2, -2).toRect(),
+                             QIcon.fromTheme("window-close").pixmap(16, 16))
+        p.end()
+
+    def mouseMoveEvent(self, event):
+        pos = event.position()
+        if self.press_pos is not None and self.press_index >= 0 and self.apps[self.press_index] \
+                and (pos - self.press_pos).manhattanLength() > QApplication.startDragDistance():
+            index = self.press_index
+            self.press_pos = None
+            drag = QDrag(self)
+            mime = QMimeData()
+            mime.setData(SLOT_MIME, str(index).encode())
+            drag.setMimeData(mime)
+            drag.setPixmap(icon_for(self.apps[index]["icon"]).pixmap(48, 48))
+            drag.exec(Qt.DropAction.MoveAction)
+            return
+        hover = self.index_at(pos)
+        if hover != self.hover:
+            self.hover = hover
+            self.setCursor(Qt.CursorShape.PointingHandCursor if hover >= 0 else Qt.CursorShape.ArrowCursor)
+            self.update()
+
+    def leaveEvent(self, _event):
+        self.hover = -1
+        self.update()
+
+    def mousePressEvent(self, event):
+        i = self.index_at(event.position())
+        if i < 0:
+            return
+        if event.button() == Qt.MouseButton.RightButton:
+            self.clear(i)
+            return
+        self.press_pos = event.position()
+        self.press_index = i
+
+    def mouseReleaseEvent(self, event):
+        if self.press_pos is None or event.button() != Qt.MouseButton.LeftButton:
+            self.press_pos = None
+            return
+        i = self.press_index
+        self.press_pos = None
+        if i < 0 or self.index_at(event.position()) != i:
+            return
+        if self.apps[i] and self.close_rect(i).contains(event.position()):
+            self.clear(i)
+            return
+        self.open_picker(i)
+
+    def open_picker(self, i):
+        picker = AppPicker(self.catalog, self)
+        picker.picked.connect(lambda app, i=i: self.set_app(i, app))
+        r = self.slot_rect(i)
+        picker.popup_at(self.mapToGlobal(QPoint(int(r.left() + 12), int(r.top() + 12))))
+
+    def set_app(self, i, app):
+        self.apps[i] = app
+        self.update()
+        self.changed.emit()
+
+    def clear(self, i):
+        if self.apps[i]:
+            self.apps[i] = None
+            self.update()
+            self.changed.emit()
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasFormat(SLOT_MIME):
+            event.acceptProposedAction()
+
+    def dragMoveEvent(self, event):
+        if not event.mimeData().hasFormat(SLOT_MIME):
+            return
+        target = self.index_at(event.position())
+        if target != self.drop_index:
+            self.drop_index = target
+            self.update()
+        event.acceptProposedAction()
+
+    def dragLeaveEvent(self, _event):
+        self.drop_index = -1
+        self.update()
+
+    def dropEvent(self, event):
+        source = int(bytes(event.mimeData().data(SLOT_MIME)).decode())
+        target = self.index_at(event.position())
+        self.drop_index = -1
+        if target >= 0 and target != source:
+            self.apps[source], self.apps[target] = self.apps[target], self.apps[source]
+            self.changed.emit()
+        self.update()
+        event.acceptProposedAction()
 
 
 class TemplateEditor(QDialog):
@@ -243,24 +522,28 @@ class TemplateEditor(QDialog):
         self.catalog = catalog
         self.template = json.loads(json.dumps(template)) if template else None
         self.setWindowTitle("Изменить шаблон" if template else "Новый шаблон")
-        self.combos = []
 
         self.name_edit = QLineEdit(self.template["name"] if self.template else "")
         self.name_edit.setPlaceholderText("Например: Работа")
 
-        self.preset_combo = QComboBox()
+        schemes = []
         if self.template:
-            self.preset_combo.addItem("Как сохранено (%d окна)" % len(self.template["slots"]), KEEP_PRESET)
-        for pid, title, _fn, _r in PRESETS:
-            self.preset_combo.addItem(title, pid)
+            schemes.append((KEEP_PRESET, "Как сохранено",
+                            [(s["x"], s["y"], s["w"], s["h"]) for s in self.template["slots"]]))
+        for pid, title, fn, default in PRESETS:
+            schemes.append((pid, title, fn(default if default is not None else 0.5)))
+        self.schemes = SchemeStrip(schemes)
 
         self.ratio = QSlider(Qt.Orientation.Horizontal)
         self.ratio.setRange(20, 80)
         self.ratio_label = QLabel()
+        self.ratio_row_label = QLabel("Пропорция:")
 
-        self.preview = PreviewWidget(catalog)
-        self.slots_box = QGroupBox("Приложения")
-        self.slots_form = QFormLayout(self.slots_box)
+        self.canvas = SlotCanvas(catalog)
+        hint = QLabel("Нажмите на часть, чтобы выбрать приложение. Перетащите приложение на другую часть, "
+                      "чтобы поменять их местами; правый клик или крестик — очистить.")
+        hint.setWordWrap(True)
+        hint.setEnabled(False)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self.accept)
@@ -268,30 +551,37 @@ class TemplateEditor(QDialog):
 
         form = QFormLayout()
         form.addRow("Название:", self.name_edit)
-        form.addRow("Схема:", self.preset_combo)
+        form.addRow("Схема:", self.schemes)
         ratio_row = QHBoxLayout()
         ratio_row.addWidget(self.ratio, 1)
         ratio_row.addWidget(self.ratio_label)
-        self.ratio_row_label = QLabel("Пропорция:")
         form.addRow(self.ratio_row_label, ratio_row)
 
         layout = QVBoxLayout(self)
         layout.addLayout(form)
-        layout.addWidget(self.preview, 1)
-        layout.addWidget(self.slots_box)
+        layout.addWidget(self.canvas, 1)
+        layout.addWidget(hint)
         layout.addWidget(buttons)
 
-        self.preset_combo.currentIndexChanged.connect(self._preset_changed)
-        self.ratio.valueChanged.connect(self._update_preview)
-        self._preset_changed()
+        self.schemes.changed.connect(self._preset_changed)
+        self.ratio.valueChanged.connect(self._ratio_changed)
         if self.template:
-            for combo, slot in zip(self.combos, self.template["slots"]):
-                combo.set_app(slot.get("app", ""), slot.get("title", ""))
-        self._update_preview()
-        self.resize(560, 640)
+            self.canvas.apps = [self._app_from_slot(s) for s in self.template["slots"]]
+        self.schemes.select(KEEP_PRESET if self.template else PRESETS[0][0])
+        self._preset_changed()
+        self.resize(820, 680)
+
+    def _app_from_slot(self, slot):
+        app = self.catalog.get(slot.get("app"))
+        if app:
+            return dict(app)
+        if not slot.get("app") and not slot.get("wmClass"):
+            return None
+        return {"id": slot.get("app", ""), "name": slot.get("title") or slot.get("app") or "?",
+                "icon": slot.get("icon", ""), "wmClass": slot.get("wmClass", "")}
 
     def _preset(self):
-        pid = self.preset_combo.currentData()
+        pid = self.schemes.current()
         return next((p for p in PRESETS if p[0] == pid), None)
 
     def _geometry(self):
@@ -301,7 +591,7 @@ class TemplateEditor(QDialog):
         _pid, _title, fn, default = preset
         return fn(self.ratio.value() / 100 if default is not None else 0.5)
 
-    def _preset_changed(self):
+    def _preset_changed(self, _pid=None):
         preset = self._preset()
         has_ratio = preset is not None and preset[3] is not None
         self.ratio.setVisible(has_ratio)
@@ -311,46 +601,29 @@ class TemplateEditor(QDialog):
             self.ratio.blockSignals(True)
             self.ratio.setValue(int(preset[3] * 100))
             self.ratio.blockSignals(False)
+        self._ratio_changed()
 
-        chosen = [c.app_id() for c in self.combos]
-        while self.slots_form.rowCount():
-            self.slots_form.removeRow(0)
-        self.combos = []
-        for i in range(len(self._geometry())):
-            combo = AppCombo(self.catalog)
-            if i < len(chosen) and chosen[i]:
-                combo.set_app(chosen[i])
-            combo.currentIndexChanged.connect(self._update_preview)
-            combo.lineEdit().editingFinished.connect(self._update_preview)
-            self.slots_form.addRow("Окно %d:" % (i + 1), combo)
-            self.combos.append(combo)
-        self._update_preview()
+    def _ratio_changed(self, *_):
+        self.ratio_label.setText("%d / %d" % (self.ratio.value(), 100 - self.ratio.value()))
+        self.canvas.set_geometry(self._geometry())
 
     def _slots(self):
         slots = []
-        for i, (combo, (x, y, w, h)) in enumerate(zip(self.combos, self._geometry())):
-            app_id = combo.app_id()
-            app = self.catalog.get(app_id)
-            old = self.template["slots"][i] if self.template and i < len(self.template["slots"]) else {}
-            same_app = old.get("app") == app_id
+        for app, (x, y, w, h) in zip(self.canvas.apps, self._geometry()):
+            app = app or {}
             slots.append({
-                "app": app_id,
-                "wmClass": (app and app["wmClass"]) or (old.get("wmClass", "") if same_app else "") or app_id,
-                "icon": (app and app["icon"]) or (old.get("icon", "") if same_app else ""),
-                "title": (app and app["name"]) or (old.get("title", "") if same_app else app_id),
+                "app": app.get("id", ""),
+                "wmClass": app.get("wmClass") or app.get("id", ""),
+                "icon": app.get("icon", ""),
+                "title": app.get("name", ""),
                 "x": round(x, 4), "y": round(y, 4), "w": round(w, 4), "h": round(h, 4),
             })
         return slots
 
-    def _update_preview(self, *_):
-        self.ratio_label.setText("%d / %d" % (self.ratio.value(), 100 - self.ratio.value()))
-        self.preview.set_slots(self._slots())
-
     def accept(self):
-        slots = self._slots()
-        missing = [i + 1 for i, s in enumerate(slots) if not s["app"]]
+        missing = [i + 1 for i, a in enumerate(self.canvas.apps) if not a]
         if missing:
-            QMessageBox.warning(self, "Шаблон", "Выберите приложение для окна %s." %
+            QMessageBox.warning(self, "Шаблон", "Выберите приложение для части %s." %
                                 ", ".join(str(m) for m in missing))
             return
         super().accept()
@@ -407,6 +680,13 @@ class KWinBridge:
             return False
         return out == "true"
 
+    def apply_template(self, template_id):
+        settings = QSettings(RUNTIME_PATH, QSettings.Format.IniFormat)
+        settings.setValue("Runtime/applyRequest",
+                          json.dumps({"id": template_id, "at": int(time.time() * 1000)}))
+        settings.sync()
+        self._effects().reconfigureEffect(SCRIPT_ID)
+
     def set_script_enabled(self, enabled):
         subprocess.run(["kwriteconfig6", "--file", "kwinrc", "--group", "Plugins",
                         "--key", SCRIPT_ID + "Enabled", "true" if enabled else "false"], check=False)
@@ -435,6 +715,9 @@ class MainWindow(QWidget):
         self.list.itemDoubleClicked.connect(lambda _item: self.edit_template())
         self.list.currentRowChanged.connect(self._update_buttons)
 
+        self.btn_apply = QPushButton(QIcon.fromTheme("dialog-ok-apply"), "Применить")
+        self.btn_apply.setToolTip("Применить шаблон к монитору, на котором сейчас курсор")
+        self.btn_apply.clicked.connect(self.apply_template)
         self.btn_new = QPushButton(QIcon.fromTheme("list-add"), "Создать…")
         self.btn_edit = QPushButton(QIcon.fromTheme("document-edit"), "Изменить…")
         self.btn_rename = QPushButton(QIcon.fromTheme("edit-rename"), "Переименовать")
@@ -451,6 +734,8 @@ class MainWindow(QWidget):
         self.btn_down.clicked.connect(lambda: self.move_template(1))
 
         buttons = QVBoxLayout()
+        buttons.addWidget(self.btn_apply)
+        buttons.addSpacing(8)
         for b in (self.btn_new, self.btn_edit, self.btn_rename, self.btn_delete):
             buttons.addWidget(b)
         updown = QHBoxLayout()
@@ -560,11 +845,23 @@ class MainWindow(QWidget):
     def _update_buttons(self, *_):
         row = self.list.currentRow()
         has = 0 <= row < len(self.templates)
-        for b in (self.btn_edit, self.btn_rename, self.btn_delete):
+        for b in (self.btn_apply, self.btn_edit, self.btn_rename, self.btn_delete):
             b.setEnabled(has)
         self.btn_up.setEnabled(has and row > 0)
         self.btn_down.setEnabled(has and row < len(self.templates) - 1)
 
+
+    def apply_template(self):
+        row = self.list.currentRow()
+        if not 0 <= row < len(self.templates):
+            return
+        if not self.kwin.script_enabled():
+            QMessageBox.information(self, "Шаблоны окон", "Сначала включите эффект «Шаблоны окон».")
+            return
+        try:
+            self.kwin.apply_template(self.templates[row]["id"])
+        except dbus.DBusException as e:
+            QMessageBox.warning(self, "Шаблоны окон", "Не удалось применить шаблон:\n%s" % e)
 
     def new_template(self):
         dlg = TemplateEditor(self.catalog, None, self)
@@ -639,6 +936,9 @@ class MainWindow(QWidget):
 
 def main():
     app = QApplication(sys.argv)
+    translator = QTranslator(app)
+    if translator.load(QLocale.system(), "qtbase", "_", QLibraryInfo.path(QLibraryInfo.LibraryPath.TranslationsPath)):
+        app.installTranslator(translator)
     app.setApplicationName("windowlayouts-settings")
     app.setApplicationDisplayName("Шаблоны окон")
     app.setDesktopFileName("windowlayouts-settings")

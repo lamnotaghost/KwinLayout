@@ -310,7 +310,7 @@ Item {
 
         Item {
             id: sw
-            readonly property int columns: Math.max(1, Math.min(view.ov.templates.length,
+            readonly property int columns: Math.max(1, Math.min(view.ov.switcherCount,
                                                                 Math.floor((width * 0.85) / view.ov.cellWidth)))
             onColumnsChanged: view.ov.switcherColumns = columns
             Component.onCompleted: view.ov.switcherColumns = columns
@@ -318,8 +318,7 @@ Item {
             Kirigami.ShadowedRectangle {
                 id: switcherPanel
                 anchors.centerIn: parent
-                width: (view.ov.templates.length > 0 ? Math.max(360, sw.columns * view.ov.cellWidth) : 440)
-                    + 2 * Kirigami.Units.largeSpacing
+                width: Math.max(440, sw.columns * view.ov.cellWidth) + 2 * Kirigami.Units.largeSpacing
                 height: column.implicitHeight + 2 * Kirigami.Units.largeSpacing
                 radius: Kirigami.Units.cornerRadius
                 color: Kirigami.Theme.backgroundColor
@@ -386,7 +385,7 @@ Item {
                             horizontalAlignment: Text.AlignHCenter
                             wrapMode: Text.Wrap
                             opacity: 0.8
-                            text: "Шаблонов пока нет. Поставьте окна рядом, наведите курсор на границу между ними и нажмите на появившуюся кнопку — или создайте шаблон в настройках."
+                            text: "Шаблонов пока нет. Сохраните текущее расположение окон или создайте шаблон в настройках."
                         }
                         PC3.Button {
                             Layout.alignment: Qt.AlignHCenter
@@ -400,11 +399,100 @@ Item {
                     }
 
                     GridLayout {
-                        visible: view.ov.templates.length > 0
                         Layout.alignment: Qt.AlignHCenter
                         columns: sw.columns
                         rowSpacing: 0
                         columnSpacing: 0
+
+                        Item {
+                            id: saveCard
+                            readonly property bool current: view.ov.switcherIndex === 0
+                            readonly property bool available: view.ov.saveWindows.length > 0
+                            Layout.preferredWidth: view.ov.cellWidth
+                            Layout.preferredHeight: view.ov.cellHeight
+                            opacity: available ? 1 : 0.5
+
+                            Rectangle {
+                                anchors.fill: parent
+                                anchors.margins: 2
+                                radius: Kirigami.Units.cornerRadius
+                                visible: saveCard.current
+                                color: Qt.rgba(Kirigami.Theme.highlightColor.r, Kirigami.Theme.highlightColor.g,
+                                               Kirigami.Theme.highlightColor.b, 0.3)
+                                border.width: 2
+                                border.color: Kirigami.Theme.highlightColor
+                            }
+
+                            ColumnLayout {
+                                anchors.fill: parent
+                                anchors.margins: Kirigami.Units.largeSpacing
+                                spacing: Kirigami.Units.smallSpacing
+
+                                Rectangle {
+                                    id: savePreview
+                                    Layout.preferredWidth: view.ov.cardWidth
+                                    Layout.preferredHeight: view.ov.previewHeight
+                                    radius: Kirigami.Units.smallSpacing
+                                    color: "transparent"
+                                    border.width: 2
+                                    border.color: Qt.rgba(Kirigami.Theme.textColor.r, Kirigami.Theme.textColor.g,
+                                                          Kirigami.Theme.textColor.b, 0.35)
+
+                                    Repeater {
+                                        model: view.ov.saveSlots
+                                        Rectangle {
+                                            required property var modelData
+                                            x: modelData.x * savePreview.width + 2
+                                            y: modelData.y * savePreview.height + 2
+                                            width: Math.max(4, modelData.w * savePreview.width - 4)
+                                            height: Math.max(4, modelData.h * savePreview.height - 4)
+                                            radius: 3
+                                            color: Qt.rgba(Kirigami.Theme.textColor.r, Kirigami.Theme.textColor.g,
+                                                           Kirigami.Theme.textColor.b, 0.06)
+                                            Kirigami.Icon {
+                                                anchors.centerIn: parent
+                                                width: Math.min(24, parent.width - 6, parent.height - 6)
+                                                height: width
+                                                source: view.ov.core ? view.ov.core.slotIcon(parent.modelData) : ""
+                                                fallback: "application-x-executable"
+                                                opacity: 0.6
+                                            }
+                                        }
+                                    }
+
+                                    Rectangle {
+                                        anchors.centerIn: parent
+                                        width: 36
+                                        height: 36
+                                        radius: 18
+                                        color: Kirigami.Theme.highlightColor
+                                        Kirigami.Icon {
+                                            anchors.centerIn: parent
+                                            width: 20
+                                            height: 20
+                                            source: "list-add"
+                                            color: Kirigami.Theme.highlightedTextColor
+                                            isMask: true
+                                        }
+                                    }
+                                }
+
+                                PC3.Label {
+                                    Layout.fillWidth: true
+                                    horizontalAlignment: Text.AlignHCenter
+                                    elide: Text.ElideRight
+                                    text: saveCard.available ? "Сохранить текущее" : "Нет окон для сохранения"
+                                }
+                            }
+
+                            MouseArea {
+                                anchors.fill: parent
+                                hoverEnabled: true
+                                enabled: !view.ov.savingName
+                                onEntered: view.ov.switcherIndex = 0
+                                onClicked: view.ov.beginSave()
+                            }
+                        }
 
                         Repeater {
                             model: view.ov.templates
@@ -412,7 +500,7 @@ Item {
                                 id: card
                                 required property var modelData
                                 required property int index
-                                readonly property bool current: index === view.ov.switcherIndex
+                                readonly property bool current: index + 1 === view.ov.switcherIndex
                                 Layout.preferredWidth: view.ov.cellWidth
                                 Layout.preferredHeight: view.ov.cellHeight
 
@@ -479,20 +567,57 @@ Item {
                                 MouseArea {
                                     anchors.fill: parent
                                     hoverEnabled: true
-                                    onEntered: view.ov.switcherIndex = card.index
+                                    enabled: !view.ov.savingName
+                                    onEntered: view.ov.switcherIndex = card.index + 1
                                     onClicked: view.ov.applyIndex(card.index)
                                 }
                             }
                         }
                     }
 
+                    RowLayout {
+                        visible: view.ov.savingName
+                        Layout.fillWidth: true
+                        spacing: Kirigami.Units.smallSpacing
+                        PC3.Label {
+                            text: "Название шаблона"
+                        }
+                        PC3.TextField {
+                            id: saveNameField
+                            Layout.fillWidth: true
+                            visible: view.ov.savingName
+                            onVisibleChanged: {
+                                if (visible) {
+                                    text = view.ov.saveSuggested;
+                                    selectAll();
+                                    forceActiveFocus();
+                                } else {
+                                    view.forceActiveFocus();
+                                }
+                            }
+                            onAccepted: view.ov.finishSave(text)
+                            Keys.onEscapePressed: view.ov.savingName = false
+                        }
+                        PC3.Button {
+                            text: "Отмена"
+                            onClicked: view.ov.savingName = false
+                        }
+                        PC3.Button {
+                            text: "Сохранить"
+                            icon.name: "document-save"
+                            onClicked: view.ov.finishSave(saveNameField.text)
+                        }
+                    }
+
                     PC3.Label {
-                        visible: view.ov.templates.length > 0
+                        visible: !view.ov.savingName
                         Layout.fillWidth: true
                         horizontalAlignment: Text.AlignHCenter
-                        opacity: 0.6
+                        opacity: view.ov.justSavedName ? 0.9 : 0.6
                         font.pointSize: Kirigami.Theme.smallFont.pointSize
-                        text: "Enter — применить · Esc — закрыть · 1–9 — сразу"
+                        text: view.ov.justSavedName
+                            ? "Шаблон «" + view.ov.justSavedName + "» сохранён"
+                            : "Enter — применить · Esc — закрыть · 1–9 — сразу"
                     }
                 }
             }

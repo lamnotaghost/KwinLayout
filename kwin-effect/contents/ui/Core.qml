@@ -35,6 +35,72 @@ Item {
         }
     }
 
+    readonly property url runtimeUrl: StandardPaths.writableLocation(StandardPaths.GenericConfigLocation) + "/windowlayouts-runtimerc"
+
+    Component {
+        id: runtimeComponent
+        Settings {
+            location: core.runtimeUrl
+            category: "Runtime"
+        }
+    }
+
+    function writeOpenApps() {
+        var seen = {};
+        var apps = [];
+        windowList().filter(isLayoutWindow).forEach(function (w) {
+            var key = String(w.desktopFileName || w.resourceClass || "").toLowerCase();
+            if (!key || seen[key]) {
+                return;
+            }
+            seen[key] = true;
+            apps.push({
+                app: appId(w),
+                wmClass: String(w.resourceClass || ""),
+                icon: windowIconName(w),
+                title: windowAppName(w)
+            });
+        });
+        var s = runtimeComponent.createObject(core);
+        s.setValue("openApps", JSON.stringify(apps));
+        s.sync();
+        s.destroy();
+    }
+
+    property real lastApplyRequest: 0
+
+    function onReconfigureRequest() {
+        var s = runtimeComponent.createObject(core);
+        var raw = s.value("applyRequest", "");
+        s.destroy();
+        var req;
+        try {
+            req = raw ? JSON.parse(raw) : null;
+        } catch (e) {
+            req = null;
+        }
+        if (!req || !req.id || !req.at || req.at <= lastApplyRequest || Date.now() - req.at > 10000) {
+            return;
+        }
+        lastApplyRequest = req.at;
+        var t = loadTemplates().filter(function (x) { return x.id === req.id; })[0];
+        if (!t) {
+            console.warn("windowlayouts: шаблон из настроек не найден: " + req.id);
+            return;
+        }
+        console.log("windowlayouts: применяю из настроек «" + t.name + "»");
+        var moves = applyTemplate(t);
+        if (overlay) {
+            overlay.playMoves(moves);
+        }
+    }
+
+    Timer {
+        id: openAppsTimer
+        interval: 1000
+        onTriggered: core.writeOpenApps()
+    }
+
     function loadTemplates() {
         var s = settingsComponent.createObject(core);
         var raw = s.value("templates", "");
@@ -501,6 +567,32 @@ Item {
             w: g.width / area.width,
             h: g.height / area.height
         });
+    }
+
+    function windowsForSave(output) {
+        if (edgesDirty) {
+            edges = computeEdges();
+            edgesDirty = false;
+        }
+        var onScreen = function (w) {
+            return isVisibleLayoutWindow(w) && w.output && w.output.name === output.name;
+        };
+        var group = [];
+        edges.forEach(function (e) {
+            [e.a, e.b].forEach(function (w) {
+                if (onScreen(w) && group.indexOf(w) === -1) {
+                    group.push(w);
+                }
+            });
+        });
+        if (group.length === 0) {
+            group = windowList().filter(onScreen);
+        }
+        group.sort(function (u, v) {
+            var gu = u.frameGeometry, gv = v.frameGeometry;
+            return gu.y - gv.y || gu.x - gv.x;
+        });
+        return group;
     }
 
     function defaultName(group) {
@@ -1363,8 +1455,9 @@ Item {
     Connections {
         target: Workspace
         function onCursorPosChanged() { core.onCursorMoved(); }
-        function onWindowAdded(w) { core.handleNewWindow(w); }
+        function onWindowAdded(w) { core.handleNewWindow(w); openAppsTimer.restart(); }
         function onWindowRemoved(w) {
+            openAppsTimer.restart();
             var key = String(w.internalId);
             var watcher = core.trackedWindows[key];
             if (watcher && watcher.destroy) {
@@ -1407,6 +1500,7 @@ Item {
     property bool cursorSeen: false
 
     Component.onCompleted: {
+        openAppsTimer.start();
         windowList().forEach(trackWindow);
         handleLoader.setSource(Qt.resolvedUrl("Handle.qml") + cacheBust, { core: core });
         dropPreviewLoader.setSource(Qt.resolvedUrl("DropPreview.qml") + cacheBust, {});

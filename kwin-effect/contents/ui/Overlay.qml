@@ -10,6 +10,15 @@ Item {
     property var core
 
     readonly property bool shown: !!effect && effect.visible
+
+    Connections {
+        target: ov.effect
+        function onConfigurationChanged() {
+            if (ov.core) {
+                ov.core.onReconfigureRequest();
+            }
+        }
+    }
     property bool closing: false
     readonly property bool open: shown && !closing
 
@@ -97,6 +106,18 @@ Item {
     property real screenAspect: 16 / 9
     property int switcherIndex: 0
     property int switcherColumns: 1
+    readonly property int switcherCount: templates.length + 1
+    property var saveWindows: []
+    property var saveSlots: []
+    property string saveSuggested: ""
+    property bool savingName: false
+    property string justSavedName: ""
+
+    Timer {
+        id: justSavedTimer
+        interval: 2500
+        onTriggered: ov.justSavedName = ""
+    }
     readonly property int cardWidth: 220
     readonly property int previewHeight: Math.round(Math.max(90, Math.min(160, cardWidth / screenAspect)))
     readonly property int cellWidth: cardWidth + 24
@@ -224,8 +245,13 @@ Item {
     function openSwitcher(screen, aspect, list) {
         mode = "switcher";
         templates = list;
+        saveWindows = core.windowsForSave(screen);
+        saveSlots = saveWindows.map(core.slotFromWindow);
+        saveSuggested = core.defaultName(saveWindows);
+        savingName = false;
+        justSavedName = "";
         screenAspect = aspect > 0 ? aspect : 16 / 9;
-        switcherIndex = 0;
+        switcherIndex = list.length > 0 ? 1 : 0;
         show(screen);
     }
 
@@ -326,15 +352,34 @@ Item {
     }
 
     function selectNext() {
-        if (templates.length > 0) {
-            switcherIndex = (switcherIndex + 1) % templates.length;
-        }
+        switcherIndex = (switcherIndex + 1) % switcherCount;
     }
 
     function selectPrevious() {
-        if (templates.length > 0) {
-            switcherIndex = (switcherIndex + templates.length - 1) % templates.length;
+        switcherIndex = (switcherIndex + switcherCount - 1) % switcherCount;
+    }
+
+    function activateSwitcherIndex(i) {
+        if (i === 0) {
+            beginSave();
+        } else {
+            applyIndex(i - 1);
         }
+    }
+
+    function beginSave() {
+        if (saveWindows.length > 0) {
+            savingName = true;
+        }
+    }
+
+    function finishSave(name) {
+        var t = core.saveGroup(saveWindows, name);
+        templates = core.loadTemplates();
+        savingName = false;
+        switcherIndex = templates.length;
+        justSavedName = t.name;
+        justSavedTimer.restart();
     }
 
     function applyIndex(i) {
@@ -353,7 +398,9 @@ Item {
         safetyTimer.restart();
         var key = event.key;
         if (key === Qt.Key_Escape) {
-            if (mode === "menu" && menuStep === "name") {
+            if (mode === "switcher" && savingName) {
+                savingName = false;
+            } else if (mode === "menu" && menuStep === "name") {
                 menuStep = "menu";
             } else {
                 close();
@@ -381,17 +428,20 @@ Item {
             return;
         }
         if (mode === "switcher") {
+            if (savingName) {
+                return;
+            }
             var columns = Math.max(1, switcherColumns);
             if (key === Qt.Key_Right || key === Qt.Key_Tab) {
                 selectNext();
             } else if (key === Qt.Key_Left || key === Qt.Key_Backtab) {
                 selectPrevious();
             } else if (key === Qt.Key_Down) {
-                switcherIndex = Math.min(templates.length - 1, switcherIndex + columns);
+                switcherIndex = Math.min(switcherCount - 1, switcherIndex + columns);
             } else if (key === Qt.Key_Up) {
                 switcherIndex = Math.max(0, switcherIndex - columns);
             } else if (key === Qt.Key_Return || key === Qt.Key_Enter) {
-                applyIndex(switcherIndex);
+                activateSwitcherIndex(switcherIndex);
             } else if (key === Qt.Key_L && (event.modifiers & Qt.MetaModifier) && (event.modifiers & Qt.ControlModifier)) {
                 selectNext();
             } else if (key >= Qt.Key_1 && key <= Qt.Key_9 && !(event.modifiers & (Qt.ControlModifier | Qt.MetaModifier | Qt.AltModifier))) {

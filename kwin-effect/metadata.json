@@ -15,7 +15,7 @@
         "License": "GPL-3.0",
         "Name": "Window Layouts",
         "Name[ru]": "Шаблоны расположения окон",
-        "Version": "2.0"
+        "Version": "1.0"
     },
     "X-KDE-Ordering": 60,
     "X-Plasma-API": "declarativescript",

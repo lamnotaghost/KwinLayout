@@ -1,0 +1,23 @@
+{
+    "KPackageStructure": "KWin/Effect",
+    "KPlugin": {
+        "Authors": [
+            {
+                "Name": "Window Layouts"
+            }
+        ],
+        "Category": "Window Management",
+        "Description": "Save window arrangements from the divider between windows and restore them with a switcher",
+        "Description[ru]": "Сохранение расположения окон с границы между ними и восстановление через переключатель",
+        "EnabledByDefault": false,
+        "Icon": "view-split-left-right",
+        "Id": "windowlayouts",
+        "License": "GPL-3.0",
+        "Name": "Window Layouts",
+        "Name[ru]": "Шаблоны расположения окон",
+        "Version": "2.0"
+    },
+    "X-KDE-Ordering": 60,
+    "X-Plasma-API": "declarativescript",
+    "X-Plasma-MainScript": "ui/main.qml"
+}

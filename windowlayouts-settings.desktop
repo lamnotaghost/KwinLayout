@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Window Layouts
+Name[ru]=Шаблоны окон
+Comment=Templates for arranging windows side by side
+Comment[ru]=Шаблоны расположения окон на экране
+Icon=view-split-left-right
+Exec=python3 @SETTINGS@
+Categories=Settings;DesktopSettings;Qt;KDE;
+Keywords=window;layout;tile;split;окна;шаблон;расположение;
+StartupNotify=true

@@ -1,0 +1,7 @@
+[Unit]
+Description=Window Layouts: запуск %I
+
+[Service]
+Type=oneshot
+KillMode=process
+ExecStart=/usr/bin/kstart --application %I
